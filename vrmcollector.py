@@ -23,20 +23,20 @@ from typing import Optional
 import requests
 from requests.exceptions import RequestException
 
-from influxdb_client import InfluxDBClient, Point, WriteOptions
-from influxdb_client.client.write_api import SYNCHRONOUS
+from influxdb import InfluxDBClient
 
 # -----------------------
 # CONFIG (prefer env vars)
 # -----------------------
 VRM_API = os.getenv("VRM_API", "https://vrmapi.victronenergy.com/v2")
 TOKEN = os.getenv("VRM_TOKEN")  # required
-SITE_ID = os.getenv("VRM_SITE_ID")  # required
+#SITE_ID = os.getenv("VRM_SITE_ID")  # required
 
-INFLUX_URL = os.getenv("INFLUX_URL", "http://localhost:8086")
-INFLUX_TOKEN = os.getenv("INFLUX_TOKEN")
-INFLUX_ORG = os.getenv("INFLUX_ORG", "-")
-INFLUX_BUCKET = os.getenv("INFLUX_BUCKET")
+INFLUX_HOST = os.getenv("INFLUX_HOST", "localhost")
+INFLUX_PORT = int(os.getenv("INFLUX_PORT", "8086"))
+INFLUX_DB = os.getenv("INFLUX_DB", "vrm")
+#INFLUX_USER = os.getenv("INFLUX_USER")
+#INFLUX_PASSWORD = os.getenv("INFLUX_PASSWORD")
 
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))
 
@@ -48,26 +48,29 @@ logger = logging.getLogger(__name__)
 
 missing = [name for name, val in (
     ("VRM_TOKEN", TOKEN),
-    ("VRM_SITE_ID", SITE_ID),
-    ("INFLUX_TOKEN", INFLUX_TOKEN),
-    ("INFLUX_BUCKET", INFLUX_BUCKET),
+    #("VRM_SITE_ID", SITE_ID),
+    ("INFLUX_DB", INFLUX_DB),
 ) if not val]
 if missing:
     logger.error("Missing required config: %s", ", ".join(missing))
     logger.error("Set them via environment variables and try again.")
     sys.exit(2)
 
-headers = {"X-Authorization": f"Bearer {TOKEN}"}
+headers = {"X-Authorization": f"Token {TOKEN}"}
 
-# Create Influx client
-influx = InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN, org=INFLUX_ORG)
-# Use synchronous writes for simplicity here
-write_api = influx.write_api(write_options=WriteOptions(batch_size=1))
+# Create InfluxDB 1.x client
+try:
+    influx = InfluxDBClient(host=INFLUX_HOST, port=INFLUX_PORT,
+                            #username=INFLUX_USER, password=INFLUX_PASSWORD,
+                            database=INFLUX_DB)
+except Exception as e:
+    logger.exception("Failed to create InfluxDB client: %s", e)
+    sys.exit(2)
 
 # -----------------------
 # Helpers
 # -----------------------
-def fetch_installations(site_id: str, timeout: int = 10) -> Optional[dict]:
+def fetch_installations(timeout: int = 10) -> Optional[dict]: # type: ignore
     """Fetch installation list from VRM API. Returns parsed JSON or None on failure."""
     url = f"{VRM_API}/installations/"
     try:
@@ -79,7 +82,7 @@ def fetch_installations(site_id: str, timeout: int = 10) -> Optional[dict]:
         return None
 
 
-def extract_latest_soc(stats: dict) -> Optional[float]:
+#def extract_latest_soc(stats: dict) -> Optional[float]:
     """Extract the latest State-of-Charge value from stats if present.
 
     The expected structure (example):
@@ -105,27 +108,52 @@ def main() -> int:
     logger.info("Starting VRM -> InfluxDB collector; polling every %ss", POLL_INTERVAL)
 
     while True:
-        stats = fetch_stats(SITE_ID)
-        if stats is None:
+        installs = fetch_installations()
+        if installs is None:
             logger.info("Fetch failed, retrying after %s seconds", POLL_INTERVAL)
             time.sleep(POLL_INTERVAL)
             continue
 
-        soc = extract_latest_soc(stats)
-        if soc is None:
-            logger.info("No SoC value found in response; full response keys: %s", list(stats.keys()))
+        #soc = extract_latest_soc(installs)
+        #if soc is None:
+        #    logger.info("No SoC value found in response; full response keys: %s", list(installs.keys()))
+        #    time.sleep(POLL_INTERVAL)
+        #    continue
+
+        # The VRM /installations response contains a top-level `records` array
+        records = installs.get("records") if isinstance(installs, dict) else None
+        if not records:
+            logger.info("No installation records found in VRM response; keys=%s", list(installs.keys()) if isinstance(installs, dict) else type(installs))
             time.sleep(POLL_INTERVAL)
             continue
 
-        point = Point("battery").field("soc", soc)
-        # Optionally add tags (e.g., site id)
-        point.tag("site_id", SITE_ID)
+        points = []
+        for rec in records:
+            # rec is an object like { "idSite": 12345, "name": "My Site", "identifier": "...", ... }
+            site_id = rec.get("idSite")
+            name = rec.get("name")
+            identifier = rec.get("identifier")
+            # measurement: vrm_installation, tag the numeric id and identifier, store the name as a string field
+            pt = {
+                "measurement": "vrm_installation",
+                "tags": {
+                    "idSite": str(site_id) if site_id is not None else "unknown",
+                    "identifier": identifier or "",
+                },
+                "fields": {
+                    "name": name or "",
+                }
+            }
+            points.append(pt)
 
         try:
-            write_api.write(bucket=INFLUX_BUCKET, record=point)
-            logger.info("Wrote SoC=%.2f to InfluxDB bucket=%s", soc, INFLUX_BUCKET)
+            ok = influx.write_points(points)
+            if not ok:
+                logger.warning("InfluxDB client reported write failure for %d points", len(points))
+            else:
+                logger.info("Wrote %d installation points to InfluxDB database=%s", len(points), INFLUX_DB)
         except Exception as e:
-            logger.exception("Failed to write point to InfluxDB: %s", e)
+            logger.exception("Failed to write installation points to InfluxDB: %s", e)
 
         time.sleep(POLL_INTERVAL)
 
