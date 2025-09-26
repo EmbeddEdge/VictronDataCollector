@@ -30,6 +30,7 @@ from influxdb import InfluxDBClient
 # -----------------------
 VRM_API = os.getenv("VRM_API", "https://vrmapi.victronenergy.com/v2")
 TOKEN = os.getenv("VRM_TOKEN")  # required
+USER_ID = os.getenv("VRM_USER_ID")  # required
 #SITE_ID = os.getenv("VRM_SITE_ID")  # required
 
 INFLUX_HOST = os.getenv("INFLUX_HOST", "localhost")
@@ -48,6 +49,7 @@ logger = logging.getLogger(__name__)
 
 missing = [name for name, val in (
     ("VRM_TOKEN", TOKEN),
+    ("VRM_USER_ID", USER_ID),
     #("VRM_SITE_ID", SITE_ID),
     ("INFLUX_DB", INFLUX_DB),
 ) if not val]
@@ -72,7 +74,7 @@ except Exception as e:
 # -----------------------
 def fetch_installations(timeout: int = 10) -> Optional[dict]: # type: ignore
     """Fetch installation list from VRM API. Returns parsed JSON or None on failure."""
-    url = f"{VRM_API}/installations/"
+    url = f"{VRM_API}/users/{USER_ID}/installations/"
     try:
         r = requests.get(url, headers=headers, timeout=timeout)
         r.raise_for_status()
